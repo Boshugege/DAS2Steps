@@ -49,8 +49,8 @@ def parse_args():
     p.add_argument("--hot_channel_k", type=float, default=3.0, help="检测热通道的阈值参数 k（median + k*MAD），默认 3.0")
     p.add_argument("--hot_mask_scale", type=float, default=1.0, help="热通道幅度抑制比例因子，默认 1.0（即抑制到 median 水平）")
     p.add_argument("--hot_channel_post_threshold", type=float, default=0.1, help="二次热通道检测阈值：若某通道 argmax 占比 > threshold 则视为噪声，默认 0.1")
-    p.add_argument("--hot_channel_post_scale", type=float, default=0.0, help="二次热通道屏蔽/抑制比例，0=完全屏蔽, 0<x<1=按比例缩小概率，默认 0.0")
-    p.add_argument("--alpha_kalman", type=float, default=0.001, help="一阶卡尔曼平滑参数 alpha，默认 0.001，越大越贴近原高斯平滑轨迹")
+    p.add_argument("--hot_channel_post_scale", type=float, default=0.5, help="二次热通道屏蔽/抑制比例，0=完全屏蔽, 0<x<1=按比例缩小概率，默认 0.5")
+    p.add_argument("--alpha_kalman", type=float, default=0.01, help="一阶卡尔曼平滑参数 alpha，默认 0.01，越大越贴近原高斯平滑轨迹")
     return p.parse_args()
 
 def butter_bandpass(lowcut, highcut, fs, order=4):
@@ -207,40 +207,36 @@ def main():
         print(f"[Message] 屏蔽通道 0 到 {ignore_end-1} 的信号")
         X_filt[:, :ignore_end] = 0.0
     
+    # ------- 3.5) 滤波后幅度均衡与坏道剔除 -------
+    
+    # 1. 计算每个通道的背景噪声水平 (使用 MAD，比标准差更抗干扰)
+    #    MAD = median(|x - median(x)|)
+    #    这里假设滤波后均值约为0，简化为 median(|x|)
+    channel_noise_level = np.median(np.abs(X_filt), axis=0)
+    
+    # 2. 计算整个系统的平均底噪 (所有通道的中位数)
+    system_median_noise = np.median(channel_noise_level)
+    
+    # 3. 识别异常高噪通道 (例如：底噪 > 系统中位数的 2.5 倍)
+    kill_threshold_ratio = 2.5  
+    bad_channels_mask = channel_noise_level > (kill_threshold_ratio * system_median_noise)
+    
+    if np.sum(bad_channels_mask) > 0:
+        bad_idx = np.where(bad_channels_mask)[0]
+        print(f"[Message] 强力抑制 {len(bad_idx)} 个高噪通道 (Ch {bad_idx[:5]}...): 噪声 > {kill_threshold_ratio}x Median")
+        baseline = np.median(X_filt[:, bad_channels_mask], axis=0)   # 取每个坏通道当前的中位值作为统一噪声基底
+        X_filt[:, bad_channels_mask] = X_filt[:, bad_channels_mask] - baseline[np.newaxis, :]
+        # 防止负值压制动态范围：做一个最小值截断
+        X_filt[:, bad_channels_mask] = np.clip(X_filt[:, bad_channels_mask], 0, None)
 
-    # ------- 3.5) 热通道检测与抑制 -------
+        # 噪声水平仍需避免除零，设一个统一常数即可
+        channel_noise_level[bad_channels_mask] = np.maximum(channel_noise_level[bad_channels_mask], 1e-6)
 
-    # 这种检测方式效果不好，我应该去除的是持续较高的信号。
-    # # 检测每通道幅度中位数，超过 median + k * MAD 的通道被认为是热通道
-    # hot_channel_k = 5.0  # 可调参数，越大越宽松
-    # channel_median = np.median(np.abs(X_filt), axis=0)  # 每列中位数
-    # median_of_medians = np.median(channel_median)
-    # mad = np.median(np.abs(channel_median - median_of_medians)) + 1e-12
-    # hot_mask = channel_median > (median_of_medians + hot_channel_k * mad)
-    # if np.sum(hot_mask) > 0:
-    #     print(f"[提示] 检测到 {np.sum(hot_mask)} 个热通道，进行幅度抑制")
-    #     print(f"热通道屏蔽强度因子：{args.hot_mask_scale}（即抑制到 {args.hot_mask_scale} * median 水平）")
-    #     X_filt[:, hot_mask] *= args.hot_mask_scale*(median_of_medians / (channel_median[hot_mask] + 1e-12))
-
-    # TODO 更合理的热通道检测
-    # 1) 计算每个通道的长期平均幅度（贯穿整个时域的信号强度）
-    long_term_mean = np.mean(np.abs(X_filt), axis=0)  # shape (C,)
-
-    # 2) 用 median + k*MAD 判断热通道（持续偏高的通道）
-    median_lt = np.median(long_term_mean)
-    mad_lt = np.median(np.abs(long_term_mean - median_lt)) + 1e-12
-    hot_mask = long_term_mean > (median_lt + args.hot_channel_k * mad_lt)
-
-    # 3) 输出检测信息
-    if np.sum(hot_mask) > 0:
-        print(f"[Message] 检测到 {np.sum(hot_mask)} 个持续性热通道")
-        print(f"[Message] 热通道抑制强度因子：{args.hot_mask_scale}")
-
-        # 4) 根据模式处理热通道
-        # 按比例抑制：乘以 scale_factor * median / long_term_mean
-        X_filt[:, hot_mask] *= args.hot_mask_scale * (median_lt / (long_term_mean[hot_mask] + 1e-12))
-
-
+    # 4. 幅度均衡化 (Whitening / Normalization)
+    #    关键步骤！将每个通道除以它自己的噪声水平。
+    #    只有真正的"突发信号"(脚步)会凸显出来。
+    safe_scale = np.where(channel_noise_level > 1e-9, channel_noise_level, 1.0)
+    X_filt = X_filt / safe_scale[None, :]
 
     # ------- 4) 计算短时能量矩阵 E(c, tframe) -------
     # 注意：short_time_energy 期望 fs 有意义。
@@ -252,6 +248,34 @@ def main():
     C, n_frames = E.shape
     print(f"[Step] 计算短时能量：窗口 {win_ms} ms，步长 {step_ms} ms => {n_frames} 帧")
 
+    # ------- 4.2) 背景噪声扣除 -------
+    # 原理：脚步是瞬态信号。减去每个通道的能量中位数(底噪)，只保留"增量"部分参与概率竞争。
+    # 这能极大程度消除那些"虽然很吵但一直不变"的通道的影响。
+    
+    # 计算每个通道的背景底噪 (按行求中位数)
+    noise_floor = np.median(E, axis=1, keepdims=True)
+    
+    # 减去底噪，并保证不小于 0
+    E = E - noise_floor
+    E = np.maximum(E, 0.0)
+    
+    # 再次平滑一下防止减去底噪后出现过多的 0 导致的数值不稳定
+    # 可选：加一个极小值作为新的底噪
+    E = E + 1e-9
+
+    # # ------- 4.5) 统一热通道屏蔽 -------
+    # long_term_mean_E = np.mean(E, axis=1)  # 每个通道长期平均能量
+    # median_E = np.median(long_term_mean_E)
+    # mad_E = np.median(np.abs(long_term_mean_E - median_E)) + 1e-12
+    # hot_mask = long_term_mean_E > (median_E + args.hot_channel_k * mad_E)
+
+    # if np.sum(hot_mask) > 0:
+    #     print(f"[Message] 检测到 {np.sum(hot_mask)} 个热通道，进行统一抑制")
+    #     scale_factor = args.hot_mask_scale if hasattr(args, 'hot_mask_scale') else 1.0
+    #     # 修正广播问题
+    #     E[hot_mask, :] *= scale_factor * median_E / (long_term_mean_E[hot_mask][:, None] + 1e-12)
+
+
     # ------- 5) 对能量矩阵做时间轴高斯平滑（可降低随机跳变） -------
     if args.gauss_smooth_sigma > 0:
         # 对每个通道沿时间做高斯滤波（仅平滑时间维的抖动）
@@ -259,30 +283,38 @@ def main():
         for c in range(C):
             E_sm[c, :] = gaussian_filter1d(E[c, :], sigma=args.gauss_smooth_sigma, mode='reflect')
         E = E_sm
-
+        
     # ------- 6) 归一化为概率（按时间帧归一化每一列） -------
     P = normalize_prob_per_time(E, eps=1e-12)  # shape (C, n_frames)
     # 也可得到全局归一化（用于可视化对比）
     P_global = E / (np.sum(E) + 1e-12)
 
-    # ------- 6.5) 二次热通道屏蔽：检查最概然点占比 -------
-    # args.hot_channel_post_threshold: 阈值，若某通道的 argmax 占比超过该比例，则认定为残留噪音
-    # args.hot_channel_post_scale: 屏蔽或抑制强度（0=完全屏蔽, 0<x<1=按比例缩小概率）
-
-    if hasattr(args, 'hot_channel_post_threshold') and args.hot_channel_post_threshold > 0:
-        n_frames = P.shape[1]
-        # 统计每个通道作为 argmax 的帧占比
-        argmax_count = np.sum(np.argmax(P, axis=0)[None, :] == np.arange(P.shape[0])[:, None], axis=1)
-        argmax_ratio = argmax_count / n_frames
-        post_hot_mask = argmax_ratio > args.hot_channel_post_threshold
-        if np.sum(post_hot_mask) > 0:
-            print(f"[Message] 二次检测到 {np.sum(post_hot_mask)} 个占比过高通道，进行额外抑制")
-            # scale 抑制概率矩阵
-            for c in np.where(post_hot_mask)[0]:
-                P[c, :] *= args.hot_channel_post_scale  # scale <1 会抑制
-            # 重新归一化每列
-            P = normalize_prob_per_time(P, eps=1e-12)
-
+    # ------- 6.5) 基于概率分布的二次热通道抑制 -------
+    # 如果某个通道在太多帧里都是"概率最大"的(超过阈值)，说明它是驻留噪声，应该被屏蔽。
+    
+    # 临时计算一次 argmax 用于统计
+    temp_argmax = np.argmax(P, axis=0)
+    
+    # 统计每个通道成为 winner 的频率
+    channel_counts = np.bincount(temp_argmax, minlength=C)
+    channel_freq = channel_counts / n_frames
+    
+    # 找出频率超过阈值的通道 (例如超过 10% 的时间都由该通道主导，对于脚步来说是不正常的)
+    post_threshold = args.hot_channel_post_threshold  # 默认 0.1
+    post_hot_mask = channel_freq > post_threshold
+    
+    if np.sum(post_hot_mask) > 0:
+        bad_channels = np.where(post_hot_mask)[0]
+        print(f"[Message] 二次检测发现持续活跃通道 (占比 > {post_threshold*100:.1f}%)：{bad_channels}")
+        print(f"          执行抑制，比例系数 scale = {args.hot_channel_post_scale}")
+        
+        # 对这些通道的概率进行惩罚 (乘以 0.0 或一个很小的数)
+        # 注意：要在 P 矩阵上操作，然后重新归一化
+        scale = args.hot_channel_post_scale
+        P[post_hot_mask, :] *= scale
+        
+        # 重新归一化 P，保证列和为 1
+        P = normalize_prob_per_time(P, eps=1e-12)
 
     # ------- 7) 每帧最可能通道（argmax）并做短时中值平滑以简化跳动 -------
     argmax_raw = np.argmax(P, axis=0)  # shape (n_frames,)
@@ -298,13 +330,11 @@ def main():
     argmax_gauss = gaussian_filter1d(argmax_raw.astype(float), sigma=sigma_gauss, mode='reflect')
 
     # 一阶卡尔曼平滑强化连续性
-    alpha_kalman = 0.001  # 可调参数，越大越贴近原高斯平滑轨迹
-    print(f"[Message] 对 argmax 结果做一阶卡尔曼平滑，alpha = {alpha_kalman}")
+    print(f"[Message] 对 argmax 结果做一阶卡尔曼平滑，alpha = {args.alpha_kalman}")
     argmax_smooth = np.zeros_like(argmax_gauss)
     argmax_smooth[0] = argmax_gauss[0]
     for t in range(1, len(argmax_gauss)):
-        argmax_smooth[t] = alpha_kalman * argmax_gauss[t] + (1 - alpha_kalman) * argmax_smooth[t-1]
-
+        argmax_smooth[t] = args.alpha_kalman * argmax_gauss[t] + (1 - args.alpha_kalman) * argmax_smooth[t-1]
     # 计算置信度：top1 - top2 比值或差值
     top1_vals = np.max(P, axis=0)
     # 找到每列第二大的值
