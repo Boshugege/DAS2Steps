@@ -83,7 +83,7 @@ options:
   --hot_channel_post_threshold HOT_CHANNEL_POST_THRESHOLD
                         二次热通道检测阈值：若某通道 argmax 占比 > threshold 则视为噪声，默认 0.1
   --hot_channel_post_scale HOT_CHANNEL_POST_SCALE
-                        二次热通道屏蔽/抑制比例，0=完全屏蔽, 0<x<1=按比例缩小概率，默认 0.0
+                        二次热通道屏蔽/抑制比例，0=完全屏蔽, 0<x<1=按比例缩小概率，默认 0.5
   --alpha_kalman ALPHA_KALMAN
-                        一阶卡尔曼平滑参数 alpha，默认 0.001，越大越贴近原高斯平滑轨迹
+                        一阶卡尔曼平滑参数 alpha，默认 0.01，越大越贴近原高斯平滑轨迹
 ```
