@@ -266,12 +266,12 @@ def main():
     # 加入极小常数以避免后续除零
     E = E + 1e-9
 
-    # [4.11] （可选）对能量做时间轴高斯平滑以降低随机跳变
-    if args.gauss_smooth_sigma > 0:
-        E_sm = np.zeros_like(E)
-        for c in range(C):
-            E_sm[c, :] = gaussian_filter1d(E[c, :], sigma=args.gauss_smooth_sigma, mode='reflect')
-        E = E_sm
+    # # [4.11] （可选）对能量做时间轴高斯平滑以降低随机跳变 # Comment by wyh 1204: useless
+    # if args.gauss_smooth_sigma > 0:
+    #     E_sm = np.zeros_like(E)
+    #     for c in range(C):
+    #         E_sm[c, :] = gaussian_filter1d(E[c, :], sigma=args.gauss_smooth_sigma, mode='reflect')
+    #     E = E_sm
 
     # [4.12] 按时间帧归一化为概率分布（每列和为 1）
     P = normalize_prob_per_time(E, eps=1e-12)  # shape (C, n_frames)
@@ -372,9 +372,12 @@ def main():
     ax3.set_ylabel("Channel index")
     ax3.set_xlabel("Time (s)")
     plt.colorbar(im3, ax=ax3, orientation='vertical', label='probability')
+
+    # TODO 取点算法有问题，需要改进。
     # 使用 frame_times 绘制最可能通道（平滑与原始）
-    ax3.plot(frame_times, argmax_smooth, color='red', linewidth=1.5, label='most likely channel (smoothed)')
-    ax3.scatter(frame_times, argmax_raw, color='white', s=6, alpha=0.6, label='argmax raw', marker='.')
+    # ax3.plot(frame_times, argmax_smooth, color='red', linewidth=1.5, label='most likely channel (smoothed)')
+    # ax3.scatter(frame_times, argmax_raw, color='white', s=6, alpha=0.6, label='argmax raw', marker='.')
+    
     ax3.legend(loc='upper right')
     fig3.tight_layout()
     fig3.savefig(os.path.join(OUTDIR, "prob_heatmap_with_argmax.png"), dpi=200)
