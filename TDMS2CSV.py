@@ -9,6 +9,7 @@ from tdms_reader import *
 from nptdms import TdmsFile
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.signal import butter, filtfilt
 
 def read_csv_start_end_times(folder_path):
     time_ranges = []

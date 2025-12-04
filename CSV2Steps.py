@@ -63,6 +63,14 @@ def parse_args():
     p.add_argument("--hot_channel_post_threshold", type=float, default=0.1, help="二次热通道检测阈值：若某通道 argmax 占比 > threshold 则视为噪声，默认 0.1")
     p.add_argument("--hot_channel_post_scale", type=float, default=0.5, help="二次热通道屏蔽/抑制比例，0=完全屏蔽, 0<x<1=按比例缩小概率，默认 0.5")
     p.add_argument("--alpha_kalman", type=float, default=0.01, help="一阶卡尔曼平滑参数 alpha，默认 0.01，越大越贴近原高斯平滑轨迹")
+    
+    # 波形图相关（简洁选项）：不启用则不生成 1202调试
+    p.add_argument("--save_waveform", action="store_true", help="若指定，则在 outdir 中保存滤波后叠加波形图（便于快速查看）")
+    p.add_argument("--wave_ch_start", type=int, default=0, help="波形图起始通道索引（默认 0）")
+    p.add_argument("--wave_ch_count", type=int, default=8, help="波形图通道数量（默认 8）")
+    p.add_argument("--wave_time_start", type=float, default=None, help="波形图起始时间（秒），默认使用开头")
+    p.add_argument("--wave_time_end", type=float, default=None, help="波形图结束时间（秒），默认使用末尾")
+    
     return p.parse_args()
 
 # ----------------------------
@@ -159,8 +167,81 @@ def normalize_prob_per_time(E, eps=1e-12):
     return P
 
 # ----------------------------
+# 简洁波形查看函数（低耦合、单函数）
+# - 传入滤波后矩阵 X_filt (T, C)；按样点索引或时间段绘制若干通道的叠加波形并保存
+# - 若希望反映上游滤波结果，请直接传入 X_filt；若想再次滤波可通过 lowcut/highcut 指定
+# - 1202调试
+# ----------------------------
+def quick_save_waveforms(X, out_png, fs=1.0,
+                         ch_start=0, ch_count=8,
+                         time_start_s=None, time_end_s=None,
+                         lowcut=None, highcut=None, order=4):
+    """
+    X: ndarray (T, C) — 已预处理/或滤波的时域矩阵
+    out_png: 输出路径
+    fs: 采样率（Hz）
+    ch_start/ch_count: 通道范围
+    time_start_s/time_end_s: 时间段（秒），None 表示全段
+    lowcut/highcut: 若提供并且 fs>0，则在绘图前对选段做一次带通滤波；否则不再滤波
+    """
+    T, C = X.shape
+    c0 = max(0, ch_start)
+    c1 = min(C, ch_start + ch_count)
+    if c0 >= c1:
+        print(f"[quick_save_waveforms] 无效通道范围 {c0}:{c1}")
+        return
+    # 计算样点范围
+    if time_start_s is None:
+        s0 = 0
+    else:
+        s0 = int(max(0, round(time_start_s * fs)))
+    if time_end_s is None:
+        s1 = T
+    else:
+        s1 = int(min(T, round(time_end_s * fs)))
+    if s1 <= s0:
+        s0, s1 = 0, T
+    seg = X[s0:s1, c0:c1]
+    if seg.size == 0:
+        print(f"[quick_save_waveforms] 无数据用于绘制: ch {c0}:{c1}, samples {s0}:{s1}")
+        return
+    # 可选再次带通（仅在用户显式提供 lowcut/highcut 且 fs 有效时执行）
+    seg_f = seg
+    if (lowcut is not None) and (highcut is not None) and (fs and fs > 0):
+        try:
+            b, a = butter_bandpass(lowcut, highcut, fs, order=order)
+            seg_f = filtfilt(b, a, seg_f, axis=0, method="pad")
+        except Exception:
+            # 失败时退回未滤波信号
+            seg_f = seg
+    # 时间轴（秒）
+    t = np.arange(s0, s1) / (fs if fs and fs > 0 else 1.0)
+    # 叠加式绘图，按通道垂直偏移
+    peak = np.nanmax(np.abs(seg_f)) if np.isfinite(np.nanmax(np.abs(seg_f))) else 1.0
+    offset = peak * 2.0 if peak > 0 else 1.0
+    nchan = seg_f.shape[1]
+    fig_h = max(2.0, 0.35 * nchan)
+    fig, ax = plt.subplots(figsize=(10, fig_h))
+    for i in range(nchan):
+        ax.plot(t, seg_f[:, i] + i * offset, linewidth=0.8)
+    ax.set_yticks([i * offset for i in range(nchan)])
+    ax.set_yticklabels([f"ch_{c0 + i}" for i in range(nchan)])
+    ax.set_xlabel("Time (s)")
+    ax.set_title(f"Waveforms ch_{c0}..ch_{c1-1}  (samples {s0}:{s1})")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    out_dir = os.path.dirname(out_png)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    fig.savefig(out_png, dpi=150)
+    plt.show()
+    plt.close(fig)
+    print(f"[quick_save_waveforms] Saved {out_png}")
+
+    # 1202调试结束
+
+# ----------------------------
 # [4] 主流程（读取 -> 预处理 -> 滤波 -> 均衡 -> 能量 -> 归一化 -> 抑制 -> 平滑）
-#     注：此处的注释分段反映了主函数内的逻辑步骤，编号与输出文件顺序一致。
 # ----------------------------
 def main():
     args = parse_args()
@@ -252,6 +333,16 @@ def main():
     safe_scale = np.where(channel_noise_level > 1e-9, channel_noise_level, 1.0)
     X_filt = X_filt / safe_scale[None, :]
 
+    # 1202Test2调试：保存滤波后波形图
+    # 输出滤波后的 .npy 以供外部脚本（如 CSV-Test.py）直接加载使用
+    # 保存为 filtered_data.npy（通用）并另存为 data.npy（方便 CSV-Test.py 的示例路径）
+    try:
+        np.save(os.path.join(OUTDIR, "filtered_data.npy"), X_filt)
+        np.save(os.path.join(OUTDIR, "data.npy"), X_filt)
+        print(f"[Output] Saved filtered_data.npy and data.npy to {OUTDIR} (for CSV-Test.py compatibility)")
+    except Exception as e:
+        print(f"[Warning] 无法保存滤波后 .npy 文件: {e}")
+
     # [4.9] 计算短时能量矩阵 E(c, tframe)
     win_ms = args.energy_win_ms
     step_ms = args.energy_step_ms
@@ -333,6 +424,18 @@ def main():
     arg_df.to_csv(os.path.join(OUTDIR, "argmax_channel.csv"), index=False)
 
     print("[Output] 已保存 energy_matrix.npy, prob_matrix.npy, prob_matrix.csv, argmax_channel.csv 到", OUTDIR)
+    
+    # 若用户要求，生成一张简洁的滤波后波形图便于快速查看（低耦合） 1202调试
+    if getattr(args, "save_waveform", False):
+        out_png = os.path.join(OUTDIR, "filtered_waveforms_overview.png")
+        # 使用 X_filt（已在上游产生）作为默认数据来源，fs 已在前文确认
+        quick_save_waveforms(X_filt, out_png,
+                             fs=fs,
+                             ch_start=args.wave_ch_start,
+                             ch_count=args.wave_ch_count,
+                             time_start_s=args.wave_time_start,
+                             time_end_s=args.wave_time_end,
+                             lowcut=args.lowcut, highcut=args.highcut)
 
     # ----------------------------
     # [5.1] 可视化：热图与时间序列
