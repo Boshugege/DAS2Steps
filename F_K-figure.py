@@ -8,15 +8,15 @@ import pandas as pd
 # data: (nt, nx) DAS array: time × channels
 # data = ...
 
-csv_path = r"D:\DAS2Steps\tdms\tdms_output\zhixingrui.csv"
-df = pd.read_csv(csv_path)
-ch_cols = [c for c in df.columns if c.lower().startswith("ch_")]
-if len(ch_cols) == 0:
-    raise RuntimeError("CSV 未找到 ch_ 列")
-data = df[ch_cols].values.astype(np.float64)  # shape (nt, nx)
+# csv_path = r"D:\DAS2Steps\tdms\tdms_output\wangdihai.csv"
+# df = pd.read_csv(csv_path)
+# ch_cols = [c for c in df.columns if c.lower().startswith("ch_")]
+# if len(ch_cols) == 0:
+#     raise RuntimeError("CSV 未找到 ch_ 列")
+# data = df[ch_cols].values.astype(np.float64)  # shape (nt, nx)
 
-# npy_path = r"D:\DAS2Steps\output\data.npy"   # <- 把此处改为你的 .npy 文件路径
-# data = np.load(npy_path)                 # data shape 应为 (nt, nx)
+npy_path = r"D:\DAS2Steps\output\data.npy"   # <- 把此处改为你的 .npy 文件路径
+data = np.load(npy_path)                 # data shape 应为 (nt, nx)
 
 if data.ndim != 2:
     raise ValueError("加载的 .npy 必须是 2D 数组 (nt, nx)，但得到 shape=" + str(data.shape))
@@ -25,8 +25,8 @@ fs = 2000.0             # sampling frequency
 dt = 1.0 / fs          # time step
 dx = 1               # channel spacing (m)
 
-fmin_crop = -2.0      # crop low freq for plotting
-fmax_crop =  2.0      # crop high freq for plotting
+fmin_crop = -0.5      # crop low freq for plotting
+fmax_crop =  0.5      # crop high freq for plotting
 db_min = -50
 db_max = 0
 
