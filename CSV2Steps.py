@@ -24,7 +24,7 @@ import os
 import argparse
 import numpy as np
 import pandas as pd
-from scipy.signal import butter, filtfilt, savgol_filter
+from scipy.signal import butter, filtfilt, savgol_filter, find_peaks
 from scipy.ndimage import median_filter, gaussian_filter1d
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -63,6 +63,8 @@ def parse_args():
     p.add_argument("--hot_channel_post_threshold", type=float, default=0.1, help="二次热通道检测阈值：若某通道 argmax 占比 > threshold 则视为噪声，默认 0.1")
     p.add_argument("--hot_channel_post_scale", type=float, default=0.5, help="二次热通道屏蔽/抑制比例，0=完全屏蔽, 0<x<1=按比例缩小概率，默认 0.5")
     p.add_argument("--alpha_kalman", type=float, default=0.01, help="一阶卡尔曼平滑参数 alpha，默认 0.01，越大越贴近原高斯平滑轨迹")
+    p.add_argument("--min_energy_threshold", type=float, default=0.001, help="事件最小能量阈值（相对）")
+    p.add_argument("--max_speed_threshold", type=float, default=10.0, help="事件最大速度阈值（通道/秒）")
     return p.parse_args()
 
 # ----------------------------
@@ -228,7 +230,7 @@ def main():
     # [4.8] 幅度均衡与坏通道（热通道）检测/抑制（多步）
     #   步骤：
     #     a) 估计每通道的背景噪声水平（使用 median(|x|) 作为鲁棒估计）
-    #     b) 识别显著高噪声通道并强力抑制
+    #     b) 识别显著高噪通道并强力抑制
     #     c) 按通道噪声水平做归一化（whitening-like）
     # ----------------------------
     # a) 估计通道噪声水平（MAD 近似）
@@ -332,6 +334,63 @@ def main():
     })
     arg_df.to_csv(os.path.join(OUTDIR, "argmax_channel.csv"), index=False)
 
+    # 新增：从 argmax 序列聚合检测事件（找“团”）
+    def detect_events_from_argmax(argmax_smooth, frame_times, P,
+                                  min_duration_frames=5, min_jump=2.0,
+                                  min_energy_threshold=0.1, max_speed_threshold=10.0):
+        """
+        从平滑 argmax 序列聚合检测事件，加入能量和速度限制。
+        - argmax_smooth: (n_frames,) 平滑后的 argmax 通道
+        - frame_times: (n_frames,)
+        - P: (C, n_frames) 概率
+        - min_energy_threshold: 事件平均能量最小值
+        - max_speed_threshold: 事件速度最大值（通道/秒）
+        返回 events: list of dict {time_s, channel_centroid, duration_s, confidence}
+        """
+        events = []
+        n = len(argmax_smooth)
+        dt = frame_times[1] - frame_times[0] if n > 1 else 1.0
+        i = 0
+        while i < n:
+            start = i
+            current_ch = argmax_smooth[i]
+            while i < n and abs(argmax_smooth[i] - current_ch) < min_jump:
+                i += 1
+            end = i - 1
+            duration_frames = end - start + 1
+            if duration_frames >= min_duration_frames:
+                ch_avg = np.mean(argmax_smooth[start:end+1])
+                time_s = np.mean(frame_times[start:end+1])
+                prob_seg = P[:, start:end+1]
+                top1_avg = np.mean(np.max(prob_seg, axis=0))
+                # 能量检查：平均 top1 > min_energy_threshold
+                if top1_avg < min_energy_threshold:
+                    continue
+                # 速度检查：通道变化率 < max_speed_threshold
+                ch_diff = np.diff(argmax_smooth[start:end+1])
+                speed = np.mean(np.abs(ch_diff) / dt) if len(ch_diff) > 0 else 0.0
+                if speed > max_speed_threshold:
+                    continue
+                events.append({
+                    "time_s": time_s,
+                    "channel_centroid": ch_avg,
+                    "duration_s": duration_frames * dt,
+                    "confidence": top1_avg,
+                    "speed": speed
+                })
+        return events
+
+    # 在 argmax_smooth 计算后添加事件检测
+    events = detect_events_from_argmax(argmax_smooth, frame_times, P,
+                                       min_duration_frames=5, min_jump=2.0,
+                                       min_energy_threshold=args.min_energy_threshold,
+                                       max_speed_threshold=args.max_speed_threshold)
+    print(f"[Step] 从 argmax 聚合检测到 {len(events)} 个事件")
+
+    # 修改 arg_df 为 events_df
+    events_df = pd.DataFrame(events) if events else pd.DataFrame(columns=["time_s", "channel_centroid", "duration_s", "confidence", "speed"])
+    events_df.to_csv(os.path.join(OUTDIR, "aggregated_events.csv"), index=False)
+
     print("[Output] 已保存 energy_matrix.npy, prob_matrix.npy, prob_matrix.csv, argmax_channel.csv 到", OUTDIR)
 
     # ----------------------------
@@ -363,24 +422,20 @@ def main():
     fig2.tight_layout()
     fig2.savefig(os.path.join(OUTDIR, "filtered_signal_heatmap.png"), dpi=200)
 
-    # [5.1.3] 概率矩阵热图，并叠加最可能通道曲线
+    # [5.1.3] 概率矩阵热图，并叠加聚合事件
     fig3, ax3 = plt.subplots(figsize=(fig_w, 6))
-    # 将列坐标映射到秒：使用 frame_times 作为横坐标范围（extent）
     extent = (frame_times[0], frame_times[-1], -0.5, C - 0.5)
     im3 = ax3.imshow(P, aspect='auto', origin='lower', cmap='viridis', extent=extent)
     ax3.set_title("Probability map P(channel, time-frame) (each column sums to 1)")
     ax3.set_ylabel("Channel index")
     ax3.set_xlabel("Time (s)")
     plt.colorbar(im3, ax=ax3, orientation='vertical', label='probability')
-
-    # TODO 取点算法有问题，需要改进。
-    # 使用 frame_times 绘制最可能通道（平滑与原始）
-    # ax3.plot(frame_times, argmax_smooth, color='red', linewidth=1.5, label='most likely channel (smoothed)')
-    # ax3.scatter(frame_times, argmax_raw, color='white', s=6, alpha=0.6, label='argmax raw', marker='.')
-    
+    # 标出聚合事件
+    for ev in events:
+        ax3.scatter(ev["time_s"], ev["channel_centroid"], color='red', s=50, marker='x', label='aggregated event' if ev == events[0] else "")
     ax3.legend(loc='upper right')
     fig3.tight_layout()
-    fig3.savefig(os.path.join(OUTDIR, "prob_heatmap_with_argmax.png"), dpi=200)
+    fig3.savefig(os.path.join(OUTDIR, "prob_heatmap_with_aggregated_events.png"), dpi=200)
 
     # [5.1.4] 置信度随时间曲线（top1 - top2）
     fig4, ax4 = plt.subplots(figsize=(fig_w, 2.5))
