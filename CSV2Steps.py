@@ -260,9 +260,10 @@ def main():
     # ----------------------------
     np.save(os.path.join(OUTDIR, "energy_matrix.npy"), E)
     np.save(os.path.join(OUTDIR, "prob_matrix.npy"), P)
-    prob_df = pd.DataFrame(P, index=ch_cols)
-    prob_df.columns = [f"t_{i}" for i in range(n_frames)]
-    prob_df.to_csv(os.path.join(OUTDIR, "prob_matrix.csv"))
+    
+    # 新增：按初始格式输出归一化概率矩阵（行=时间帧，列=通道）
+    prob_df_transpose = pd.DataFrame(P.T, columns=ch_cols)
+    prob_df_transpose.to_csv(os.path.join(OUTDIR, "prob_matrix_initial_format.csv"), index=False)
 
     # 新增：从 argmax 序列聚合检测事件（找“团”）
     def detect_events_from_argmax(argmax_smooth, frame_times, P,
