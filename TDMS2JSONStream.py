@@ -12,13 +12,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
-try:
-    from nptdms import TdmsFile
-except Exception as exc:  # pragma: no cover - runtime dependency
-    TdmsFile = None
-    _tdms_import_error = exc
-else:
-    _tdms_import_error = None
+from nptdms import TdmsFile
 
 
 def _iter_all_channels(tdms_file):
@@ -30,15 +24,8 @@ def _iter_all_channels(tdms_file):
 
 
 def _pick_channels(all_channels, start_idx, end_idx):
-    if not all_channels:
-        return []
-    last_idx = len(all_channels) - 1
-    start_idx = max(0, start_idx)
     if end_idx is None:
-        end_idx = last_idx
-    end_idx = min(end_idx, last_idx)
-    if start_idx > end_idx:
-        return []
+        return all_channels[start_idx:]
     return all_channels[start_idx : end_idx + 1]
 
 
@@ -62,15 +49,10 @@ def stream_tdms(
     max_samples,
     start_time_iso,
 ):
-    if TdmsFile is None:
-        raise RuntimeError("nptdms is not available. Please install it before running this script.") from _tdms_import_error
-
     tdms = TdmsFile.read(tdms_path)
 
     all_channels = _iter_all_channels(tdms)
     channels = _pick_channels(all_channels, channel_start, channel_end)
-    if not channels:
-        raise RuntimeError("No channels selected from TDMS file.")
     # Fixed large read size to reduce TDMS I/O overhead.
     chunk_samples = 5000
 
