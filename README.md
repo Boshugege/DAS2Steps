@@ -4,6 +4,8 @@
 
 详见 `Usage.md` `TDMS2JSONStream` 。
 
+## 原项目
+
 从多通道分布式光纤读取 TDMS 数据到 CSV 中（每列 ch_*，每行一个时间采样），计算时域上“脚步存在的通道概率分布”（channels × time），并绘图标出每个时刻最可能的通道。
 
 ## TDMS2CSV.py
