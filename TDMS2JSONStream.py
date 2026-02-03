@@ -12,8 +12,9 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 import numpy as np
-from scipy.signal import butter, sosfilt
+from scipy.signal import butter, sosfilt, lfilter, firwin
 from nptdms import TdmsFile
+import pywt
 
 
 def _iter_all_channels(tdms_file):
@@ -72,16 +73,118 @@ def _prepare_bandpass(sample_rate, bp_low, bp_high, bp_order, channels):
     return sos, zi
 
 
-def _iter_chunks(channels, start_sample, end_sample, chunk_samples, sos=None, zi=None):
+def _prepare_fir_bandpass(sample_rate, bp_low, bp_high, delay_ms, taps, channels):
+    if bp_low is None or bp_high is None:
+        return None, None, None
+    nyq = 0.5 * sample_rate
+    if not (0.0 < bp_low < bp_high < nyq):
+        return None, None, None
+
+    if taps is None:
+        delay_s = (delay_ms or 0.0) / 1000.0
+        max_taps = int(round(2.0 * delay_s * sample_rate)) + 1
+        taps = max(31, max_taps)
+    if taps % 2 == 0:
+        taps += 1
+
+    coeffs = firwin(
+        taps,
+        [bp_low, bp_high],
+        pass_zero=False,
+        fs=sample_rate,
+    )
+    zi = [np.zeros(taps - 1, dtype=float) for _ in channels]
+    return coeffs, zi, taps
+
+
+def _wavelet_denoise(data, wavelet='db4', level=3, mode='soft'):
+    """
+    对单通道信号进行小波降噪
+    
+    参数:
+        data: 1D 信号数组
+        wavelet: 小波类型 (db2/db4/sym4)
+        level: 分解层数
+        mode: 阈值模式 ('soft' 软阈值 / 'hard' 硬阈值)
+    
+    返回:
+        降噪后的信号
+    """
+    # 小波分解
+    coeffs = pywt.wavedec(data, wavelet, level=level)
+    
+    # 估计噪声标准差 (使用最高频细节系数的 MAD)
+    # sigma = MAD / 0.6745 (假设高斯噪声)
+    detail_1 = coeffs[-1]  # 最高频细节
+    sigma = np.median(np.abs(detail_1)) / 0.6745
+    
+    # 计算通用阈值 (VisuShrink): threshold = sigma * sqrt(2 * log(n))
+    n = len(data)
+    threshold = sigma * np.sqrt(2 * np.log(n)) if n > 1 else 0
+    
+    # 对细节系数应用阈值
+    denoised_coeffs = [coeffs[0]]  # 保留近似系数不变
+    for i in range(1, len(coeffs)):
+        if mode == 'soft':
+            # 软阈值: sign(x) * max(|x| - threshold, 0)
+            denoised = pywt.threshold(coeffs[i], threshold, mode='soft')
+        else:
+            # 硬阈值: x if |x| > threshold else 0
+            denoised = pywt.threshold(coeffs[i], threshold, mode='hard')
+        denoised_coeffs.append(denoised)
+    
+    # 小波重构
+    return pywt.waverec(denoised_coeffs, wavelet)[:len(data)]
+
+
+def _iter_chunks(
+    channels,
+    start_sample,
+    end_sample,
+    chunk_samples,
+    sos=None,
+    zi=None,
+    fir_coeffs=None,
+    fir_zi=None,
+    denoise_wavelet=None,
+    denoise_level=3,
+    denoise_mode='soft',
+):
+    """
+    迭代读取数据块，支持带通滤波和小波降噪
+    
+    参数:
+        denoise_wavelet: 降噪小波类型，None 表示不降噪
+        denoise_level: 降噪分解层数
+        denoise_mode: 'soft' 或 'hard' 阈值
+    """
     for chunk_start in range(start_sample, end_sample, chunk_samples):
         chunk_end = min(chunk_start + chunk_samples, end_sample)
         chunk_data = [np.asarray(ch[chunk_start:chunk_end], dtype=float) for ch in channels]
+        
+        # 第一层：带通滤波
         if sos is not None:
             filtered = []
             for idx, data in enumerate(chunk_data):
                 data, zi[idx] = sosfilt(sos, data, zi=zi[idx])
                 filtered.append(data)
             chunk_data = filtered
+        elif fir_coeffs is not None:
+            filtered = []
+            for idx, data in enumerate(chunk_data):
+                data, fir_zi[idx] = lfilter(fir_coeffs, [1.0], data, zi=fir_zi[idx])
+                filtered.append(data)
+            chunk_data = filtered
+        
+        # 第二层：小波降噪
+        if denoise_wavelet is not None:
+            denoised = []
+            for data in chunk_data:
+                data = _wavelet_denoise(data, wavelet=denoise_wavelet, 
+                                        level=denoise_level, mode=denoise_mode)
+                denoised.append(data)
+            chunk_data = denoised
+        
         yield chunk_start, chunk_data
 
 
@@ -93,12 +196,80 @@ def _iter_decimated_samples(chunk_start, chunk_data, decimate_factor):
         yield sample_index, sample_vector
 
 
-def _update_sta_lta(sta, lta, sta_alpha, lta_alpha, sample_vector):
-    energy = np.abs(sample_vector)
-    sta = (1.0 - sta_alpha) * sta + sta_alpha * energy
-    lta = (1.0 - lta_alpha) * lta + lta_alpha * energy
-    ratio = sta / np.maximum(lta, 1e-9)
-    return sta, lta, ratio
+class RealtimeWaveletDetector:
+    """实时小波脚步检测器 - 滑动窗口小波变换"""
+    
+    def __init__(self, n_channels, wavelet='db4', level=3, 
+                 threshold_factor=3.0, fs=2000):
+        self.wavelet_obj = pywt.Wavelet(wavelet)
+        self.wavelet_name = wavelet
+        self.level = level
+        self.threshold_factor = threshold_factor
+        self.fs = fs
+        self.n_channels = n_channels
+        
+        # 滤波器长度决定所需缓冲区大小
+        self.filter_len = self.wavelet_obj.dec_len
+        self.buffer_size = self.filter_len * (2 ** level)
+        
+        # 每通道的滑动缓冲区
+        self.buffers = np.zeros((n_channels, self.buffer_size), dtype=float)
+        self.buf_idx = 0
+        self.samples_collected = 0
+        
+        # 自适应阈值的递归估计 (每通道)
+        self.energy_baseline = np.ones(n_channels, dtype=float) * 1e-6
+        self.energy_mad = np.ones(n_channels, dtype=float) * 1e-6
+        self.alpha = 0.02  # 阈值更新速率
+        
+    def update(self, sample_vector):
+        """
+        处理新采样点，返回检测结果
+        
+        sample_vector: (n_channels,) 当前采样值
+        返回: (energies, ratio, ready)
+            - energies: 各通道小波能量 (n_channels,)
+            - ratio: 能量/阈值比值 (n_channels,)
+            - ready: 本次是否有有效输出
+        """
+        sample_arr = np.asarray(sample_vector, dtype=float)
+        
+        # 更新缓冲区
+        self.buffers[:, self.buf_idx] = sample_arr
+        self.buf_idx = (self.buf_idx + 1) % self.buffer_size
+        self.samples_collected += 1
+        
+        # 缓冲区未满时不计算
+        if self.samples_collected < self.buffer_size:
+            return np.zeros(self.n_channels), np.zeros(self.n_channels), False
+        
+        # 只在缓冲区循环一周时计算 (每 buffer_size 个样本计算一次)
+        if self.buf_idx != 0:
+            return np.zeros(self.n_channels), np.zeros(self.n_channels), False
+        
+        # 对每个通道计算小波细节系数能量
+        energies = np.zeros(self.n_channels, dtype=float)
+        for ch in range(self.n_channels):
+            # 重排缓冲区为时序正确的顺序
+            buf = np.roll(self.buffers[ch], -self.buf_idx)
+            
+            # 小波分解
+            coeffs = pywt.wavedec(buf, self.wavelet_obj, level=self.level)
+            
+            # 累加细节系数能量 (level 1-2 对应脚步的高频成分)
+            for d in range(1, min(3, self.level + 1)):
+                energies[ch] += np.sum(coeffs[d] ** 2)
+        
+        # 更新自适应阈值 (指数移动平均)
+        self.energy_baseline = (1 - self.alpha) * self.energy_baseline + self.alpha * energies
+        deviation = np.abs(energies - self.energy_baseline)
+        self.energy_mad = (1 - self.alpha) * self.energy_mad + self.alpha * deviation
+        
+        # 计算相对强度比值
+        threshold = self.energy_baseline + self.threshold_factor * self.energy_mad
+        ratio = energies / np.maximum(threshold, 1e-9)
+        
+        return energies, ratio, True
 
 
 def _smooth_ratio(ratio, neighbor_radius):
@@ -172,9 +343,15 @@ def stream_tdms(
     bp_low,
     bp_high,
     bp_order,
-    sta_window_s,
-    lta_window_s,
-    sta_lta_threshold,
+    filter_kind,
+    fir_delay_ms,
+    fir_taps,
+    denoise_wavelet,
+    denoise_level,
+    denoise_mode,
+    wavelet_type,
+    wavelet_level,
+    wavelet_threshold,
     event_refractory_s,
     neighbor_radius,
 ):
@@ -207,29 +384,71 @@ def stream_tdms(
     last_lag_ms = 0.0
     max_lag_ms = None
 
-    # Process: filters and STA/LTA state.
-    sos, zi = _prepare_bandpass(sample_rate, bp_low, bp_high, bp_order, channels)
-    dt = decimate_factor * seconds_per_sample
-    sta_alpha = min(1.0, dt / sta_window_s) if sta_window_s > 0 else 1.0
-    lta_alpha = min(1.0, dt / lta_window_s) if lta_window_s > 0 else 1.0
-    sta = np.zeros(total_channels, dtype=float)
-    lta = np.full(total_channels, 1e-6, dtype=float)
+    # Process: filters and wavelet detector state.
+    sos, zi = None, None
+    fir_coeffs, fir_zi, fir_numtaps = None, None, None
+    if filter_kind == "fir":
+        fir_coeffs, fir_zi, fir_numtaps = _prepare_fir_bandpass(
+            sample_rate, bp_low, bp_high, fir_delay_ms, fir_taps, channels
+        )
+        if fir_coeffs is not None:
+            delay_samples = (fir_numtaps - 1) / 2.0
+            delay_ms = 1000.0 * delay_samples / sample_rate
+            print(f"[Filter] FIR bandpass taps={fir_numtaps}, delay≈{delay_ms:.1f} ms")
+    else:
+        sos, zi = _prepare_bandpass(sample_rate, bp_low, bp_high, bp_order, channels)
+        if sos is not None:
+            print(f"[Filter] IIR bandpass order={bp_order}")
+    
+    # 打印降噪信息
+    if denoise_wavelet:
+        print(f"[Denoise] Using {denoise_wavelet} wavelet denoising, "
+              f"level={denoise_level}, mode={denoise_mode}")
+    
+    # 初始化小波检测器
+    wavelet_detector = RealtimeWaveletDetector(
+        n_channels=total_channels,
+        wavelet=wavelet_type,
+        level=wavelet_level,
+        threshold_factor=wavelet_threshold,
+        fs=sample_rate
+    )
+    print(f"[Wavelet] Using {wavelet_type} wavelet, level={wavelet_level}, "
+          f"buffer_size={wavelet_detector.buffer_size} samples")
+    
     last_event_time = None
+    last_valid_ratio = np.zeros(total_channels, dtype=float)
 
     try:
         for chunk_start, chunk_data in _iter_chunks(
-            channels, start_sample, end_sample, chunk_samples, sos=sos, zi=zi
+            channels,
+            start_sample,
+            end_sample,
+            chunk_samples,
+            sos=sos,
+            zi=zi,
+            fir_coeffs=fir_coeffs,
+            fir_zi=fir_zi,
+            denoise_wavelet=denoise_wavelet, denoise_level=denoise_level,
+            denoise_mode=denoise_mode
         ):
             for sample_index, sample_vector in _iter_decimated_samples(
                 chunk_start, chunk_data, decimate_factor
             ):
                 timestamp = sample_index * seconds_per_sample
-                sta, lta, ratio = _update_sta_lta(sta, lta, sta_alpha, lta_alpha, sample_vector)
-                smoothed = _smooth_ratio(ratio, neighbor_radius)
+                
+                # 小波检测
+                energies, ratio, ready = wavelet_detector.update(sample_vector)
+                if ready:
+                    last_valid_ratio = ratio
+                    smoothed = _smooth_ratio(ratio, neighbor_radius)
+                else:
+                    # 缓冲区未满时使用上次的比值
+                    smoothed = _smooth_ratio(last_valid_ratio, neighbor_radius)
                 event_payload, last_event_time = _build_event_payload(
                     smoothed,
                     neighbor_radius,
-                    sta_lta_threshold,
+                    1.0,  # 小波检测阈值已在检测器内部处理，这里用 1.0
                     last_event_time,
                     timestamp,
                     event_refractory_s,
@@ -282,7 +501,7 @@ def parse_args(argv):
     )
     parser.add_argument("tdms_path", help="Path to .tdms file")
     parser.add_argument("--host", default="127.0.0.1", help="Target host")
-    parser.add_argument("--port", type=int, required=True, help="Target port")
+    parser.add_argument("--port", type=int, default=9000, help="Target port")
     parser.add_argument(
         "--protocol",
         choices=["udp", "tcp"],
@@ -327,38 +546,77 @@ def parse_args(argv):
     parser.add_argument(
         "--bp-low",
         type=float,
-        default=None,
-        help="Butterworth bandpass low cutoff (Hz)",
+        default=10.0,
+        help="Bandpass low cutoff (Hz)",
     )
     parser.add_argument(
         "--bp-high",
         type=float,
-        default=None,
-        help="Butterworth bandpass high cutoff (Hz)",
+        default=60.0,
+        help="Bandpass high cutoff (Hz)",
     )
     parser.add_argument(
         "--bp-order",
         type=int,
         default=2,
-        help="Butterworth bandpass order",
+        help="Butterworth bandpass order (IIR only)",
     )
     parser.add_argument(
-        "--sta-window-s",
-        type=float,
-        default=0.03,
-        help="STA window in seconds",
+        "--filter-kind",
+        choices=["fir", "iir"],
+        default="fir",
+        help="Bandpass filter type: fir (linear-phase) or iir (Butterworth)",
     )
     parser.add_argument(
-        "--lta-window-s",
+        "--fir-delay-ms",
         type=float,
-        default=0.5,
-        help="LTA window in seconds",
+        default=200.0,
+        help="Target FIR group delay in ms (used to size taps)",
     )
     parser.add_argument(
-        "--sta-lta-threshold",
+        "--fir-taps",
+        type=int,
+        default=None,
+        help="Override FIR tap count (odd number). If set, --fir-delay-ms is ignored.",
+    )
+    parser.add_argument(
+        "--denoise-wavelet",
+        type=str,
+        choices=["db2", "db4", "db8", "sym4", "sym8", "coif3"],
+        default=None,
+        help="Wavelet type for denoising (None=disabled, db4/sym4/etc)",
+    )
+    parser.add_argument(
+        "--denoise-level",
+        type=int,
+        default=3,
+        help="Wavelet decomposition level for denoising (default: 3)",
+    )
+    parser.add_argument(
+        "--denoise-mode",
+        type=str,
+        choices=["soft", "hard"],
+        default="soft",
+        help="Threshold mode for denoising: soft (default) or hard",
+    )
+    parser.add_argument(
+        "--wavelet-type",
+        type=str,
+        choices=["db2", "db4", "sym4"],
+        default="db4",
+        help="Wavelet type for detection (db2/db4/sym4, default: db4)",
+    )
+    parser.add_argument(
+        "--wavelet-level",
+        type=int,
+        default=3,
+        help="Wavelet decomposition level (default: 3)",
+    )
+    parser.add_argument(
+        "--wavelet-threshold",
         type=float,
-        default=2.0,
-        help="STA/LTA trigger threshold",
+        default=3.0,
+        help="Wavelet detection threshold factor (default: 3.0)",
     )
     parser.add_argument(
         "--event-refractory-s",
@@ -391,9 +649,15 @@ def main(argv):
         bp_low=args.bp_low,
         bp_high=args.bp_high,
         bp_order=args.bp_order,
-        sta_window_s=args.sta_window_s,
-        lta_window_s=args.lta_window_s,
-        sta_lta_threshold=args.sta_lta_threshold,
+        filter_kind=args.filter_kind,
+        fir_delay_ms=args.fir_delay_ms,
+        fir_taps=args.fir_taps,
+        denoise_wavelet=args.denoise_wavelet,
+        denoise_level=args.denoise_level,
+        denoise_mode=args.denoise_mode,
+        wavelet_type=args.wavelet_type,
+        wavelet_level=args.wavelet_level,
+        wavelet_threshold=args.wavelet_threshold,
         event_refractory_s=args.event_refractory_s,
         neighbor_radius=args.neighbor_radius,
     )

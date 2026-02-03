@@ -21,7 +21,7 @@ def _parse_args(argv=None):
         description="Receive JSON stream and plot signals in real time."
     )
     parser.add_argument("--host", default="0.0.0.0", help="Bind host")
-    parser.add_argument("--port", type=int, required=True, help="Bind port")
+    parser.add_argument("--port", type=int, default=9000, help="Bind port")
     parser.add_argument(
         "--protocol",
         choices=["udp", "tcp"],

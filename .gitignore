@@ -1,2 +1,4 @@
-/output*/
 /tdms/
+/.venv/
+/__pycache__/
+/out*/

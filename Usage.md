@@ -121,3 +121,7 @@ public class TdmsUdpReceiver : MonoBehaviour
 Notes for Unity:
 - Use UDP because packets are independent; order is by arrival.
 - Each UDP datagram contains exactly one JSON object.
+
+C:/Users/boshu/Desktop/srt/DAS2Steps/.venv/Scripts/python.exe c:/Users/boshu/Desktop/srt/DAS2Steps/TDMS2JSONStream.py "C:\Users\boshu\Desktop\B202_1m_1000Hz_10m__UTC_20231115_071033.961.tdms" --sample-rate 1000 --wavelet-type sym4 --wavelet-level 4 --denoise-wavelet db4 --denoise-mode hard
+
+python JSONStreamPlot.py --protocol udp --show-events

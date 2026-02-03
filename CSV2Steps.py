@@ -154,8 +154,48 @@ def main():
     OUTDIR = args.outdir
     os.makedirs(OUTDIR, exist_ok=True)
 
-    # [4.1] 读取 CSV 并自动识别通道列（以 ch_ 开头），转为 numpy 数组，读取采样率 fs
-    df = pd.read_csv(INPUT_CSV)
+    # [4.1] 读取 CSV/TDMS 并自动识别通道列（以 ch_ 开头），转为 numpy 数组，读取采样率 fs
+    def _load_tdms_to_dataframe(path):
+        try:
+            from nptdms import TdmsFile
+        except ImportError as exc:
+            raise ImportError("读取 TDMS 需要 nptdms，请先安装：pip install nptdms") from exc
+
+        tdms_file = TdmsFile.read(path)
+        channels = []
+        for group in tdms_file.groups():
+            for channel in group.channels():
+                channels.append(channel)
+        if len(channels) == 0:
+            raise ValueError("TDMS 中未检测到任何通道。")
+
+        data_list = []
+        lengths = []
+        for idx, ch in enumerate(channels):
+            data = np.asarray(ch[:], dtype=np.float64)
+            data_list.append(data)
+            lengths.append(len(data))
+
+        min_len = min(lengths)
+        if min_len == 0:
+            raise ValueError("TDMS 通道数据为空。")
+        if len(set(lengths)) != 1:
+            print(f"[Warn] TDMS 通道长度不一致，将截断到最短长度 {min_len}。")
+
+        data_stack = np.stack([d[:min_len] for d in data_list], axis=1)  # (T, C)
+        col_names = [f"ch_{i}" for i in range(data_stack.shape[1])]
+        return pd.DataFrame(data_stack, columns=col_names)
+
+    def _load_input_dataframe(path):
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".csv":
+            return pd.read_csv(path)
+        if ext == ".tdms":
+            print("[Info] 检测到 TDMS 输入，开始读取并转换为 DataFrame。")
+            return _load_tdms_to_dataframe(path)
+        raise ValueError("输入文件格式不支持，请提供 .csv 或 .tdms 文件。")
+
+    df = _load_input_dataframe(INPUT_CSV)
     colnames = df.columns.tolist()
     ch_cols = [c for c in colnames if c.lower().startswith("ch_")]
     if len(ch_cols) == 0:
