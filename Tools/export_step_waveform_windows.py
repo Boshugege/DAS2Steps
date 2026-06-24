@@ -43,8 +43,8 @@ def parse_args():
         default=1,
         help="Whether start/end event numbers are 0-based or 1-based. Default is 1.",
     )
-    p.add_argument("--window-sec", type=float, default=4.0, help="Time window length in seconds.")
-    p.add_argument("--channels", type=int, default=6, help="Number of adjacent channels to plot.")
+    p.add_argument("--window-sec", type=float, default=8.0, help="Time window length in seconds.")
+    p.add_argument("--channels", type=int, default=10, help="Number of adjacent channels to plot.")
     p.add_argument(
         "--time-column",
         default="time_s",
@@ -199,23 +199,22 @@ def plot_waveforms(X, times, channel_names, event_time, event_channel, title, ou
         scale = 1.0
 
     spacing = 2.8
-    offsets = np.arange(Y.shape[1] - 1, -1, -1, dtype=float) * spacing
-    rel_time = times - event_time
+    offsets = np.arange(Y.shape[1], dtype=float) * spacing
 
     fig_h = max(4.0, 0.72 * Y.shape[1] + 1.8)
     fig, ax = plt.subplots(figsize=(13, fig_h))
     for idx, name in enumerate(channel_names):
         y = Y[:, idx] / scale
-        ax.plot(rel_time, y + offsets[idx], linewidth=0.8, color="#1f77b4")
+        ax.plot(times, y + offsets[idx], linewidth=0.8, color="#1f77b4")
 
-    ax.axvline(0.0, color="#d62728", linewidth=1.2, alpha=0.9)
+    ax.axvline(event_time, color="#d62728", linewidth=1.2, alpha=0.9)
     if event_channel in channel_names:
         y_idx = channel_names.index(event_channel)
         ax.axhline(offsets[y_idx], color="#d62728", linewidth=0.8, alpha=0.55)
 
     ax.set_yticks(offsets)
     ax.set_yticklabels(channel_names)
-    ax.set_xlabel("Time relative to predicted event (s)")
+    ax.set_xlabel("Time (s)")
     ax.set_ylabel("Channel")
     ax.set_title(title)
     ax.grid(True, axis="x", alpha=0.25)
